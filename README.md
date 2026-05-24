@@ -116,7 +116,22 @@ pip install -r requirements.txt
 pip install -r requirements_molmo.txt
 ```
 
-4. Create a `.env` file with your API keys:
+4. Download the PointArena benchmark data:
+```bash
+pip install huggingface_hub
+./scripts/download_pointarena_data.sh
+```
+
+This creates the files and folders required by `molmo_evaluator.py`:
+
+```text
+data.json
+pixmo_metadata.csv
+selected_images/
+selected_masks/
+```
+
+5. Create a `.env` file with your API keys:
 ```bash
 # Copy the example configuration
 cp .env.example .env
@@ -132,7 +147,7 @@ SAM_MODEL_TYPE=vit_h
 SAVED_MODELS_DIR=./models
 ```
 
-5. Download the SAM model checkpoint:
+6. Download the SAM model checkpoint:
 ```bash
 # Download directly from Meta AI's repository
 wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth
@@ -168,10 +183,26 @@ python model_evaluator.py --model gemini-2.0-flash --type gemini
 python molmo_evaluator.py --model Molmo-7B-D-0924 --type molmo
 ```
 
+For MolmoPoint-8B and Molmo2-8B:
+
+```bash
+./scripts/run_molmopoint_8b.sh --no-resume
+./scripts/run_molmo2_8b.sh --no-resume
+```
+
+Use `--no-resume` when changing prompts, point parsing, model checkpoints, or after a failed run. Otherwise the evaluator may reuse entries from `static_results/`.
+
 The evaluator will:
 1. Generate visualizations showing points predicted by each model
 2. Save these visualizations to the `point_on_mask` directory
 3. Create a JSON results file with detailed metrics   
+
+MolmoPoint/Molmo2 outputs are saved to:
+
+```text
+static_results/results_molmo_allenai_MolmoPoint-8B_simple_prompt.json
+static_results/results_molmo_allenai_Molmo2-8B_simple_prompt.json
+```
 
 
 ### Point-Battle
@@ -268,6 +299,8 @@ The system supports five specialized task categories:
 - gemini-2.0-flash
 
 ### Open Source Models
+- MolmoPoint-8B
+- Molmo2-8B
 - Molmo-7B-D-0924
 - Molmo-7B-O-0924
 - Molmo-72B-0924

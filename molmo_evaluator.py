@@ -10,6 +10,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 from dotenv import load_dotenv
 import io
+from tqdm import tqdm
 
 # Import the same model interfaces and helpers as the main app
 # from openai import OpenAI
@@ -17,6 +18,7 @@ import io
 import torch
 from transformers import (
     AutoModelForCausalLM, 
+    AutoModelForImageTextToText,
     AutoProcessor, 
     AutoTokenizer, 
     GenerationConfig,
@@ -42,10 +44,13 @@ load_dotenv()
 # Constants
 IMAGES_DIR = Path("images")
 MASKS_DIR = Path("masks")
+SELECTED_IMAGES_DIR = Path("selected_images")
+SELECTED_MASKS_DIR = Path("selected_masks")
 POINT_ON_MASK_DIR = Path("point_on_mask")  # New directory for visualization images
 
 # Create the point_on_mask directory if it doesn't exist
 POINT_ON_MASK_DIR.mkdir(exist_ok=True, parents=True)
+DEBUG = os.getenv("POINTARENA_DEBUG", "0").lower() in {"1", "true", "yes"}
 
 # Load the image_filename to points mapping from CSV file
 IMAGE_POINTS_MAP = {}
@@ -63,14 +68,14 @@ except Exception as e:
 # Available models
 OPENAI_MODELS = ["gpt-4o", "gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1-nano"]
 GEMINI_MODELS = ["gemini-2.5-flash-preview-04-17", "gemini-2.5-pro-preview-05-06","gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash", "gemini-1.5-flash-8b", "gemini-1.5-pro"]
-MOLMO_MODELS = ["Molmo-7B-D-0924", "Molmo-7B-O-0924", "Molmo-72B-0924"]
+MOLMO_MODELS = ["MolmoPoint-8B", "Molmo2-8B", "Molmo-7B-D-0924", "Molmo-7B-O-0924", "Molmo-72B-0924"]
 QWEN_MODELS = ["Qwen2.5-VL-7B-Instruct"]
 LLAVA_MODELS = ["llava-onevision-qwen2-7b-ov-hf"]
 CLAUDE_MODELS = ["claude-3-7-sonnet-20250219"]
 GROK_MODELS = ["grok-2-vision-latest"]
 
 # Use local models
-USE_LOCAL_MODELS = True
+USE_LOCAL_MODELS = os.getenv("USE_LOCAL_MODELS", "0").lower() in {"1", "true", "yes"}
 if USE_LOCAL_MODELS:
     SAVED_MODELS_DIR = Path(os.getenv("SAVED_MODELS_DIR", "models"))
     SAVED_MODELS_DIR.mkdir(exist_ok=True, parents=True)
@@ -80,6 +85,7 @@ else:
 # Initialize Molmo model and processor (lazy loading)
 molmo_model = None
 molmo_processor = None
+molmo_loaded_model_name = None
 
 # Initialize Qwen model and processor (lazy loading)
 qwen_model = None
@@ -101,13 +107,32 @@ def print_complete_prompt(system_content, user_content, model_name, image_path):
     print(f"USER CONTENT:\n{user_content}")
     print("="*80 + "\n")
 
+
+def is_molmo_chat_model(model_name):
+    name = model_name.lower()
+    return "molmopoint" in name or "molmo2" in name
+
+
+def first_model_device(model):
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
+
+def move_batch_to_device(batch, device):
+    return {k: v.to(device) if hasattr(v, "to") else v for k, v in batch.items()}
+
+
 def initialize_molmo(model_name="allenai/Molmo-7B-D-0924"):
     """Initialize Molmo model and processor if not already initialized."""
-    global molmo_model, molmo_processor
+    global molmo_model, molmo_processor, molmo_loaded_model_name
     
-    if molmo_model is None or molmo_processor is None:
+    if molmo_model is None or molmo_processor is None or molmo_loaded_model_name != model_name:
         # Get model short name
         model_short_name = model_name.split('/')[-1]
+        model_cls = AutoModelForImageTextToText if is_molmo_chat_model(model_name) else AutoModelForCausalLM
+        torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         
         if USE_LOCAL_MODELS:
             # Use local model
@@ -122,14 +147,13 @@ def initialize_molmo(model_name="allenai/Molmo-7B-D-0924"):
             molmo_processor = AutoProcessor.from_pretrained(
                 local_model_dir,
                 trust_remote_code=True,
-                torch_dtype='auto',
-                device_map='auto'
+                padding_side="left",
             )
             
-            molmo_model = AutoModelForCausalLM.from_pretrained(
+            molmo_model = model_cls.from_pretrained(
                 local_model_dir,
                 trust_remote_code=True,
-                torch_dtype='auto',
+                torch_dtype=torch_dtype,
                 device_map='auto'
             )
         else:
@@ -140,17 +164,18 @@ def initialize_molmo(model_name="allenai/Molmo-7B-D-0924"):
             molmo_processor = AutoProcessor.from_pretrained(
                 model_name,
                 trust_remote_code=True,
-                torch_dtype='auto',
-                device_map='auto'
+                padding_side="left",
             )
             
             # Load model from remote
-            molmo_model = AutoModelForCausalLM.from_pretrained(
+            molmo_model = model_cls.from_pretrained(
                 model_name,
                 trust_remote_code=True,
-                torch_dtype='auto',
+                torch_dtype=torch_dtype,
                 device_map='auto'
             )
+        molmo_model.eval()
+        molmo_loaded_model_name = model_name
         
     return molmo_model, molmo_processor
 
@@ -202,79 +227,211 @@ def get_original_points_info(image_path, category):
     return original_points_info
 
 
+def resolve_image_path(image_filename, category):
+    """Find an image in either the repo-native or HF archive layout."""
+    candidates = []
+    if category:
+        candidates.extend([
+            IMAGES_DIR / category / image_filename,
+            SELECTED_IMAGES_DIR / category / image_filename,
+        ])
+    candidates.extend([
+        IMAGES_DIR / image_filename,
+        SELECTED_IMAGES_DIR / image_filename,
+    ])
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    return None
+
+
+def resolve_mask_path(mask_filename, category):
+    """Find a mask in either the repo-native or HF archive layout."""
+    candidates = []
+    if category:
+        candidates.extend([
+            MASKS_DIR / category / mask_filename,
+            SELECTED_MASKS_DIR / category / mask_filename,
+        ])
+    candidates.extend([
+        MASKS_DIR / mask_filename,
+        SELECTED_MASKS_DIR / mask_filename,
+    ])
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
 
 def extract_points(text, image_w, image_h):
-    """Extract points from text using multiple regex patterns.
-    
-    Extracts normalized coordinates (0-100 range) and converts them to pixel coordinates.
-    Handles multiple formats like Click(x,y), (x,y), x="x" y="y", and p=xxx,yyy.
-    
-    Args:
-        text: Text containing coordinate information
-        image_w: Image width in pixels
-        image_h: Image height in pixels
-        
-    Returns:
-        List of points as numpy arrays in pixel coordinates
-    """
+    """Extract model point outputs and convert them to pixel coordinates."""
     all_points = []
-    for match in re.finditer(r"Click\(([0-9]+\.[0-9]), ?([0-9]+\.[0-9])\)", text):
-        try:
-            point = [float(match.group(i)) for i in range(1, 3)]
-        except ValueError:
-            pass
-        else:
-            point = np.array(point)
-            if np.max(point) > 100:
-                # Treat as an invalid output
-                continue
-            point /= 100.0
-            point = point * np.array([image_w, image_h])
-            all_points.append(point)
 
-    for match in re.finditer(r"\(([0-9]+\.[0-9]),? ?([0-9]+\.[0-9])\)", text):
-        try:
-            point = [float(match.group(i)) for i in range(1, 3)]
-        except ValueError:
-            pass
-        else:
-            point = np.array(point)
-            if np.max(point) > 100:
-                # Treat as an invalid output
-                continue
-            point /= 100.0
+    def to_pixel_point(x, y):
+        point = np.array([float(x), float(y)], dtype=float)
+        max_coord = float(np.max(point))
+        if max_coord <= 1.0:
             point = point * np.array([image_w, image_h])
-            all_points.append(point)
-    for match in re.finditer(r'x\d*="\s*([0-9]+(?:\.[0-9]+)?)"\s+y\d*="\s*([0-9]+(?:\.[0-9]+)?)"', text):
-        try:
-            point = [float(match.group(i)) for i in range(1, 3)]
-        except ValueError:
-            pass
-        else:
-            point = np.array(point)
-            if np.max(point) > 100:
-                # Treat as an invalid output
+        elif max_coord <= 100.0:
+            point = point / 100.0 * np.array([image_w, image_h])
+        elif max_coord <= 1000.0:
+            point = point / 1000.0 * np.array([image_w, image_h])
+        return point
+
+    def append_coord_sequence(coord_text):
+        nums = [float(n) for n in re.findall(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", coord_text)]
+        if len(nums) < 2:
+            return
+
+        # Molmo2 commonly emits numbered points:
+        #   "1 1 652 535" -> point id=1, x=652, y=535
+        #   "1 109 544 2 189 469 ..." -> id,x,y,id,x,y,...
+        if len(nums) % 3 == 0 and all(nums[i].is_integer() for i in range(0, len(nums), 3)):
+            for i in range(0, len(nums), 3):
+                all_points.append(to_pixel_point(nums[i + 1], nums[i + 2]))
+            return
+
+        # Some Molmo2 outputs include a leading "1 1" prefix before x,y.
+        if len(nums) == 4 and nums[0].is_integer() and nums[1].is_integer():
+            all_points.append(to_pixel_point(nums[2], nums[3]))
+            return
+
+        # Fallback: consume plain x,y pairs.
+        for i in range(0, len(nums) - 1, 2):
+            all_points.append(to_pixel_point(nums[i], nums[i + 1]))
+
+    for match in re.finditer(r'<points?\s+coords="([^"]+)"', text):
+        append_coord_sequence(match.group(1))
+
+    number = r"([0-9]+(?:\.[0-9]+)?)"
+    patterns = [
+        rf"Click\(\s*{number}\s*,\s*{number}\s*\)",
+        rf"[\(\[]\s*{number}\s*[, ]\s*{number}\s*[\)\]]",
+        rf'x\d*="\s*{number}"\s+y\d*="\s*{number}"',
+        rf'"x"\s*:\s*{number}\s*,\s*"y"\s*:\s*{number}',
+    ]
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            try:
+                all_points.append(to_pixel_point(match.group(1), match.group(2)))
+            except ValueError:
                 continue
-            point /= 100.0
-            point = point * np.array([image_w, image_h])
-            all_points.append(point)
+
     for match in re.finditer(r'(?:\d+|p)\s*=\s*([0-9]{3})\s*,\s*([0-9]{3})', text):
         try:
             point = [int(match.group(i)) / 10.0 for i in range(1, 3)]
         except ValueError:
-            pass
+            continue
         else:
             point = np.array(point)
-            if np.max(point) > 100:
-                # Treat as an invalid output
-                continue
             point /= 100.0
             point = point * np.array([image_w, image_h])
             all_points.append(point)
+
     return all_points
+
+
+def call_molmo_chat_model(image_path, object_name, model_name, category=None):
+    """Run MolmoPoint/Molmo2 chat-template checkpoints and return pixel points."""
+    try:
+        model, processor = initialize_molmo(model_name)
+        image = Image.open(image_path).convert("RGB")
+        img_width, img_height = image.size
+        original_points_info = get_original_points_info(image_path, category)
+        prompt = (
+            f"Point to: {object_name}\n"
+            f"{original_points_info}"
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        use_native_pointing = hasattr(model, "extract_image_points") and hasattr(model, "build_logit_processor_from_inputs")
+        template_kwargs = {
+            "add_generation_prompt": True,
+            "tokenize": True,
+            "return_dict": True,
+            "return_tensors": "pt",
+        }
+        if use_native_pointing:
+            template_kwargs["padding"] = True
+            template_kwargs["return_pointing_metadata"] = True
+
+        inputs = processor.apply_chat_template(messages, **template_kwargs)
+        metadata = inputs.pop("metadata", None)
+        inputs = move_batch_to_device(inputs, first_model_device(model))
+
+        device = first_model_device(model)
+        autocast_enabled = getattr(device, "type", str(device)).startswith("cuda")
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
+            generate_kwargs = {}
+            if use_native_pointing:
+                generate_kwargs["logits_processor"] = model.build_logit_processor_from_inputs(inputs)
+            output = model.generate(
+                **inputs,
+                **generate_kwargs,
+                max_new_tokens=500,
+                do_sample=False,
+            )
+
+        generated_tokens = output[:, inputs["input_ids"].shape[-1]:]
+        if use_native_pointing and metadata is not None:
+            if hasattr(processor, "post_process_image_text_to_text"):
+                content = processor.post_process_image_text_to_text(
+                    generated_tokens,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )[0]
+            else:
+                content = processor.batch_decode(
+                    generated_tokens,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )[0]
+            native_points = model.extract_image_points(
+                content,
+                metadata["token_pooling"],
+                metadata["subpatch_mapping"],
+                metadata["image_sizes"],
+            )
+            points = [{"point": [float(point[-2]), float(point[-1])]} for point in native_points if len(point) >= 2]
+            if category != "counting" and len(points) > 1:
+                points = [points[0]]
+            if points:
+                return points
+        else:
+            content = processor.batch_decode(
+                generated_tokens,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )[0].strip()
+        if DEBUG:
+            print(f"\n[DEBUG] Raw {model_name} output for {object_name} in {image_path}:")
+            print(content)
+
+        extracted_points = extract_points(content, img_width, img_height)
+        points = [{"point": [float(p[0]), float(p[1])]} for p in extracted_points]
+        if category != "counting" and len(points) > 1:
+            points = [points[0]]
+        return points
+    except Exception as e:
+        if isinstance(e, torch.cuda.OutOfMemoryError) or "CUDA out of memory" in str(e):
+            raise
+        print(f"Error calling {model_name} on {image_path}: {e}")
+        return []
 
 def call_molmo(image_path, object_name, model_name="allenai/Molmo-7B-D-0924", category=None):
     """Call Molmo model to get points for the specified object."""
+    if is_molmo_chat_model(model_name):
+        return call_molmo_chat_model(image_path, object_name, model_name, category)
+
     try:
         # Initialize model and processor if not already done
         model, processor = initialize_molmo(model_name)
@@ -434,34 +591,40 @@ def load_mask(mask_path):
 def is_point_in_mask(point, mask, img_width, img_height):
     """Check if a point is inside the mask."""
     if mask is None or point is None:
-        print(f"[DEBUG MASK] Invalid mask or point: mask={mask is not None}, point={point}")
+        if DEBUG:
+            print(f"[DEBUG MASK] Invalid mask or point: mask={mask is not None}, point={point}")
         return False
     
     # Unpack point (x, y format in pixel coordinates)
     x, y = point["point"]
-    print(f"[DEBUG MASK] Checking point x={x}, y={y} (pixel coordinates)")
+    if DEBUG:
+        print(f"[DEBUG MASK] Checking point x={x}, y={y} (pixel coordinates)")
     
     # Convert to integers for indexing
     pixel_x = int(x)
     pixel_y = int(y)
-    print(f"[DEBUG MASK] Pixel coordinates: x={pixel_x}, y={pixel_y}, image size: {img_width}x{img_height}")
+    if DEBUG:
+        print(f"[DEBUG MASK] Pixel coordinates: x={pixel_x}, y={pixel_y}, image size: {img_width}x{img_height}")
     
     # Ensure coordinates are within image bounds
     if pixel_y < 0 or pixel_y >= img_height or pixel_x < 0 or pixel_x >= img_width:
-        print(f"[DEBUG MASK] Point outside image bounds: x={pixel_x}, y={pixel_y}")
+        if DEBUG:
+            print(f"[DEBUG MASK] Point outside image bounds: x={pixel_x}, y={pixel_y}")
         return False
     
     # Check if point falls within the mask
     is_in_mask = mask[pixel_y, pixel_x]
-    print(f"[DEBUG MASK] Point in mask: {is_in_mask}")
+    if DEBUG:
+        print(f"[DEBUG MASK] Point in mask: {is_in_mask}")
     return is_in_mask
 
 def visualize_points_on_mask(image_path, mask, points, output_path, img_width, img_height):
     """Create a visualization of points overlaid on the mask and save it."""
     try:
-        print(f"\n[DEBUG VISUALIZATION] Creating visualization for {output_path}")
-        print(f"[DEBUG VISUALIZATION] Image dimensions: {img_width}x{img_height}")
-        print(f"[DEBUG VISUALIZATION] Points to visualize: {points}")
+        if DEBUG:
+            print(f"\n[DEBUG VISUALIZATION] Creating visualization for {output_path}")
+            print(f"[DEBUG VISUALIZATION] Image dimensions: {img_width}x{img_height}")
+            print(f"[DEBUG VISUALIZATION] Points to visualize: {points}")
         
         # Create a visualization of the mask (white foreground, black background)
         mask_vis = np.zeros((img_height, img_width, 3), dtype=np.uint8)
@@ -475,16 +638,19 @@ def visualize_points_on_mask(image_path, mask, points, output_path, img_width, i
         for point in points:
             # Unpack point (x, y format in pixel coordinates)
             x, y = point["point"]
-            print(f"[DEBUG VISUALIZATION] Processing point: x={x}, y={y} (pixel coordinates)")
+            if DEBUG:
+                print(f"[DEBUG VISUALIZATION] Processing point: x={x}, y={y} (pixel coordinates)")
             
             # Convert to integers for drawing
             pixel_x = int(x)
             pixel_y = int(y)
-            print(f"[DEBUG VISUALIZATION] Drawing at pixel coordinates: x={pixel_x}, y={pixel_y}")
+            if DEBUG:
+                print(f"[DEBUG VISUALIZATION] Drawing at pixel coordinates: x={pixel_x}, y={pixel_y}")
             
             # Draw a cross at the point location (red for better visibility on white mask)
             point_size = max(5, min(img_width, img_height) // 100)  # Adaptive point size
-            print(f"[DEBUG VISUALIZATION] Drawing point with size {point_size} at ({pixel_x}, {pixel_y})")
+            if DEBUG:
+                print(f"[DEBUG VISUALIZATION] Drawing point with size {point_size} at ({pixel_x}, {pixel_y})")
             draw.line((pixel_x - point_size, pixel_y, pixel_x + point_size, pixel_y), fill=(255, 0, 0), width=3)
             draw.line((pixel_x, pixel_y - point_size, pixel_x, pixel_y + point_size), fill=(255, 0, 0), width=3)
             
@@ -495,10 +661,12 @@ def visualize_points_on_mask(image_path, mask, points, output_path, img_width, i
         
         # Save the image
         mask_image.save(output_path)
-        print(f"[DEBUG VISUALIZATION] Visualization saved to {output_path}")
+        if DEBUG:
+            print(f"[DEBUG VISUALIZATION] Visualization saved to {output_path}")
         return True
     except Exception as e:
-        print(f"[DEBUG VISUALIZATION] Error creating visualization: {e}")
+        if DEBUG:
+            print(f"[DEBUG VISUALIZATION] Error creating visualization: {e}")
         print(f"Error creating visualization: {e}")
         return False
 
@@ -581,21 +749,22 @@ def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
         }
         processed_images = set()
     
+    evaluable_items = [item for item in data if "mask_filename" in item]
+
     # Process each image in the dataset
     item_count = 0
-    for i, item in enumerate(data):
-        # Skip items without mask_filename
-        if "mask_filename" not in item:
-            continue
-        
+    progress = tqdm(evaluable_items, desc=f"Evaluating {model_name}", unit="img", dynamic_ncols=True)
+    for i, item in enumerate(progress):
         # Get image filename
         image_filename = item["image_filename"]
         
         # Skip already processed images if resuming
         if image_filename in processed_images:
-            print(f"Skipping already processed image: {image_filename}")
+            if DEBUG:
+                print(f"Skipping already processed image: {image_filename}")
             if progress_callback:
                 progress_callback(f"Skipping already processed image: {image_filename}")
+            progress.set_postfix(success=results["success"], failure=results["failure"], skipped=len(processed_images))
             continue
         
         results["total"] += 1
@@ -603,21 +772,13 @@ def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
         
         # Update progress
         if progress_callback:
-            progress_callback(f"Processing image {i+1}/{len(data)}: {image_filename}")
+            progress_callback(f"Processing image {i+1}/{len(evaluable_items)}: {image_filename}")
         
         # Get category from the data item
         category = item.get("category", "")
         
-        # Find the image using both filename and category
-        image_path = None
-        if category:
-            # Direct lookup using category and filename
-            category_dir = IMAGES_DIR / category
-            potential_path = category_dir / image_filename
-            if category_dir.is_dir() and potential_path.exists():
-                image_path = str(potential_path)
-        
-      
+        # Find the image using both filename and category.
+        image_path = resolve_image_path(image_filename, category)
         
         if image_path is None:
             print(f"Image not found: {image_filename} in category: {category}")
@@ -633,9 +794,9 @@ def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
         
         # Get mask path
         mask_filename = item["mask_filename"]
-        mask_path = MASKS_DIR / mask_filename
+        mask_path = resolve_mask_path(mask_filename, category)
         
-        if not mask_path.exists():
+        if mask_path is None:
             print(f"Mask not found: {mask_filename}")
             if progress_callback:
                 progress_callback(f"Mask not found: {mask_filename}")
@@ -686,7 +847,8 @@ def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
         
         # Call model to get points
         try:
-            print(f"Testing {model_name} on image {image_filename} with query: '{query}'")
+            if DEBUG:
+                print(f"Testing {model_name} on image {image_filename} with query: '{query}'")
             if progress_callback:
                 progress_callback(f"Testing {model_name} on image {image_filename} with query: '{query}'")
             points = model_func(image_path, query, model_name, category)
@@ -730,7 +892,8 @@ def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
                     break
             
             if points_in_mask:
-                print(f"Success for {image_filename}")
+                if DEBUG:
+                    print(f"Success for {image_filename}")
                 if progress_callback:
                     progress_callback(f"Success for {image_filename}")
                 results["success"] += 1
@@ -741,7 +904,8 @@ def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
                     "visualization": str(vis_path)  # Add visualization path to results
                 })
             else:
-                print(f"Failure for {image_filename}: points outside mask")
+                if DEBUG:
+                    print(f"Failure for {image_filename}: points outside mask")
                 if progress_callback:
                     progress_callback(f"Failure for {image_filename}: points outside mask")
                 results["failure"] += 1
@@ -752,6 +916,9 @@ def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
                     "visualization": str(vis_path)  # Add visualization path to results
                 })
         except Exception as e:
+            if isinstance(e, torch.cuda.OutOfMemoryError) or "CUDA out of memory" in str(e):
+                print(f"CUDA out of memory while processing {image_filename}. Stopping evaluation.")
+                raise
             print(f"Error processing {image_filename} with {model_name}: {e}")
             if progress_callback:
                 progress_callback(f"Error processing {image_filename} with {model_name}: {e}")
@@ -761,6 +928,14 @@ def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
                 "success": False,
                 "reason": f"Processing error: {e}"
             })
+
+        success_rate = (results["success"] / results["total"] * 100) if results["total"] else 0.0
+        progress.set_postfix(
+            category=category,
+            success=results["success"],
+            failure=results["failure"],
+            rate=f"{success_rate:.1f}%",
+        )
         
         # Save intermediate results every 100 images
         if item_count % 100 == 0:
