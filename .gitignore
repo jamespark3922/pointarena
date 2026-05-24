@@ -1,0 +1,8 @@
+
+__pycache__/
+data.json
+data/
+pixmo_metadata.csv
+point_on_mask/
+selected_images/
+selected_masks/
