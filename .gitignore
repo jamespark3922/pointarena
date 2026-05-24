@@ -6,3 +6,5 @@ pixmo_metadata.csv
 point_on_mask/
 selected_images/
 selected_masks/
+points_on_mask
+static_results
