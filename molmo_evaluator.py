@@ -670,6 +670,60 @@ def visualize_points_on_mask(image_path, mask, points, output_path, img_width, i
         print(f"Error creating visualization: {e}")
         return False
 
+
+def build_category_summary(results):
+    display_names = {
+        "affordable": "Affordance",
+        "spatial": "Spatial",
+        "reasoning": "Reasoning",
+        "steerable": "Steerability",
+        "counting": "Counting",
+    }
+    summary = {}
+    for key, display in display_names.items():
+        details = [d for d in results.get("details", []) if d.get("category") == key]
+        total = len(details)
+        success = sum(1 for d in details if d.get("success"))
+        summary[display] = {
+            "success": success,
+            "total": total,
+            "accuracy": 100.0 * success / total if total else 0.0,
+        }
+
+    total = sum(v["total"] for v in summary.values())
+    success = sum(v["success"] for v in summary.values())
+    summary["Average"] = {
+        "success": success,
+        "total": total,
+        "accuracy": 100.0 * success / total if total else 0.0,
+    }
+    return summary
+
+
+def save_category_summary(results, results_file):
+    summary = build_category_summary(results)
+    base = Path(results_file)
+    summary_json = base.with_name(base.stem + "_category_summary.json")
+    summary_csv = base.with_name(base.stem + "_category_summary.csv")
+
+    print("\nCategory summary:")
+    print(" | ".join(f"{cat}: {stats['accuracy']:.2f}%" for cat, stats in summary.items()))
+
+    try:
+        with open(summary_json, "w") as f:
+            json.dump(summary, f, indent=2)
+
+        with open(summary_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Category", "Success", "Total", "Accuracy"])
+            for category, stats in summary.items():
+                writer.writerow([category, stats["success"], stats["total"], f"{stats['accuracy']:.2f}"])
+        print(f"Category summary saved to {summary_json} and {summary_csv}")
+    except PermissionError as e:
+        print(f"Could not write category summary files: {e}")
+    return summary
+
+
 def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
     """Evaluate model performance on the dataset."""
     # Load data.json file
@@ -787,6 +841,7 @@ def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
             results["failure"] += 1
             results["details"].append({
                 "image": image_filename,
+                "category": category,
                 "success": False,
                 "reason": f"Image not found in category: {category}"
             })
@@ -803,6 +858,7 @@ def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
             results["failure"] += 1
             results["details"].append({
                 "image": image_filename,
+                "category": category,
                 "success": False,
                 "reason": "Mask not found"
             })
@@ -823,6 +879,7 @@ def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
             results["failure"] += 1
             results["details"].append({
                 "image": image_filename,
+                "category": category,
                 "success": False,
                 "reason": f"Error loading image: {e}"
             })
@@ -840,6 +897,7 @@ def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
             results["failure"] += 1
             results["details"].append({
                 "image": image_filename,
+                "category": category,
                 "success": False,
                 "reason": f"Error loading mask: {e}"
             })
@@ -861,6 +919,7 @@ def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
                 results["failure"] += 1
                 results["details"].append({
                     "image": image_filename,
+                    "category": category,
                     "success": False,
                     "reason": "No points returned"
                 })
@@ -879,6 +938,7 @@ def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
                 results["failure"] += 1
                 results["details"].append({
                     "image": image_filename,
+                    "category": category,
                     "success": False,
                     "reason": f"Count mismatch: expected {expected_count}, got {len(points)}"
                 })
@@ -899,6 +959,7 @@ def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
                 results["success"] += 1
                 results["details"].append({
                     "image": image_filename,
+                    "category": category,
                     "success": True,
                     "points_count": len(points),
                     "visualization": str(vis_path)  # Add visualization path to results
@@ -911,6 +972,7 @@ def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
                 results["failure"] += 1
                 results["details"].append({
                     "image": image_filename,
+                    "category": category,
                     "success": False,
                     "reason": "Points outside mask",
                     "visualization": str(vis_path)  # Add visualization path to results
@@ -925,6 +987,7 @@ def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
             results["failure"] += 1
             results["details"].append({
                 "image": image_filename,
+                "category": category,
                 "success": False,
                 "reason": f"Processing error: {e}"
             })
@@ -958,6 +1021,7 @@ def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
             # Save intermediate results
             with open(results_file, "w") as f:
                 json.dump(results, f, indent=2)
+            save_category_summary(results, results_file)
             print(f"Intermediate results saved to {results_file}")
             if progress_callback:
                 progress_callback(f"Intermediate results saved to {results_file}")
@@ -983,6 +1047,7 @@ def evaluate_model(model_name, model_type, progress_callback=None, resume=True):
         # Save final results
         with open(results_file, "w") as f:
             json.dump(results, f, indent=2)
+        save_category_summary(results, results_file)
         print(f"Final results saved to {results_file}")
         if progress_callback:
             progress_callback(f"Final results saved to {results_file}")
