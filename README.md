@@ -204,6 +204,19 @@ static_results/results_molmo_allenai_MolmoPoint-8B_simple_prompt.json
 static_results/results_molmo_allenai_Molmo2-8B_simple_prompt.json
 ```
 
+Current runs print and save a leaderboard-style category breakdown with:
+
+```text
+Affordance | Spatial | Reasoning | Steerability | Counting | Average
+```
+
+For an older, renamed, or copied result file that does not already have a category summary, run:
+
+```bash
+python scripts/summarize_pointarena_results.py \
+  static_results/results_molmo_allenai_MolmoPoint-8B_simple_prompt-v1.json
+```
+
 
 ### Point-Battle
 
